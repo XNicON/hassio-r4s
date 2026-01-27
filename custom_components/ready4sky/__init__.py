@@ -95,20 +95,18 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     async_track_time_interval(hass, hass.data[DOMAIN][config_entry.entry_id].update, scan_delta)
 
-    for component in SUPPORTED_DOMAINS:
-        hass.async_create_task(hass.config_entries.async_forward_entry_setup(config_entry, component))
+    await hass.config_entries.async_forward_entry_setups(config_entry, SUPPORTED_DOMAINS)
 
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, SUPPORTED_DOMAINS)
     try:
-        for component in SUPPORTED_DOMAINS:
-            await hass.config_entries.async_forward_entry_unload(entry, component)
         hass.data[DOMAIN].pop(entry.entry_id)
     except ValueError:
         pass
-    return True
+    return unload_ok
 
 
 class RedmondCommand(Enum):

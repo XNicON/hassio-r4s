@@ -69,6 +69,7 @@ class BTLEConnection:
                 self._conn = BleakClient(self._device or self._mac)
 
                 await self._conn.connect()
+                await self._conn.stop_notify(UART_TX_CHAR_UUID)
                 await self._conn.start_notify(UART_TX_CHAR_UUID, self.handleNotification)
                 await self.connectAfter()
                 break

@@ -4,7 +4,7 @@ from homeassistant.components.water_heater import (
     WaterHeaterEntity,
     WaterHeaterEntityFeature,
     ATTR_TEMPERATURE,
-    WaterHeaterEntityEntityDescription
+    WaterHeaterEntityDescription
 )
 from homeassistant.const import (
     STATE_OFF,
@@ -31,7 +31,7 @@ STATE_KEEP_WARM = 'keep_warm'
 class RedmondKettle(WaterHeaterEntity):
     def __init__(self, kettle):
         self._kettle = kettle
-        self.entity_description = WaterHeaterEntityEntityDescription(
+        self.entity_description = WaterHeaterEntityDescription(
             key="kettle",
             name=kettle._name + " Kettle",
             icon="mdi:kettle"

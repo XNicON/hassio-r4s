@@ -1,7 +1,7 @@
 from homeassistant.components.water_heater import (
     WaterHeaterEntity,
     WaterHeaterEntityFeature,
-    ATTR_TEMPERATURE, WaterHeaterEntityEntityDescription
+    ATTR_TEMPERATURE, WaterHeaterEntityDescription
 )
 from homeassistant.const import (
     STATE_OFF,
@@ -27,7 +27,7 @@ OPERATIONS_LIST.append(STATE_OFF)
 class RedmondCooker(WaterHeaterEntity):
     def __init__(self, kettle):
         self._kettle = kettle
-        self.entity_description = WaterHeaterEntityEntityDescription(
+        self.entity_description = WaterHeaterEntityDescription(
             key="cooker",
             name=kettle._name + " Cooker",
             icon="mdi:chef-hat",

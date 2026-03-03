@@ -1,6 +1,7 @@
 #!/usr/local/bin/python3
 # coding: utf-8
 
+import asyncio
 from dataclasses import dataclass
 import logging
 import secrets
@@ -24,7 +25,8 @@ class Ready4SkyRuntimeData:
 
 
 async def async_setup(hass, config):
-    hass.data.setdefault(DOMAIN, {})
+    data = hass.data.setdefault(DOMAIN, {})
+    data.setdefault("startup_lock", asyncio.Lock())
     return True
 
 
@@ -40,12 +42,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     await kettler.setNameAndType()
 
     first_connect_ok = False
-    try:
-        first_connect_ok = await kettler.firstConnect()
-    except BaseException:
-        # Device can be offline during HA startup; keep integration loaded
-        # and let coordinator retries bring it online later.
-        _LOGGER.debug("Initial connect to %s failed, continuing in unavailable state", mac)
+    startup_lock: asyncio.Lock = hass.data[DOMAIN]["startup_lock"]
+    async with startup_lock:
+        try:
+            first_connect_ok = await kettler.firstConnect()
+        except Exception:
+            # Device can be offline during HA startup; keep integration loaded
+            # and let coordinator retries bring it online later.
+            _LOGGER.debug("Initial connect to %s failed, continuing in unavailable state", mac)
 
     coordinator = Ready4SkyCoordinator(hass, kettler, scan_interval)
     coordinator.async_set_updated_data(kettler.export_state())

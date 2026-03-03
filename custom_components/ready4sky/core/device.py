@@ -48,6 +48,11 @@ class Ready4SkyCommand(Enum):
 
 
 class Ready4SkyDevice:
+    _GLOBAL_USER_COMMAND_UNTIL = 0.0
+    _USER_COMMAND_WINDOW_SEC = 15.0
+    _DUPLICATE_COMMAND_WINDOW_SEC = 0.8
+    _QUEUED_DUPLICATE_COMMAND_WINDOW_SEC = 8.0
+
     def __init__(self, hass, addr, key, backlight, name=None):
         self.hass = hass
         self._type = None
@@ -56,7 +61,7 @@ class Ready4SkyDevice:
         self._key = key
         self._use_backlight = backlight
         self._tgtemp = CONF_MIN_TEMP
-        self._temp = 0
+        self._temp = None
         self._Watts = 0
         self._alltime = 0
         self._times = 0
@@ -77,14 +82,23 @@ class Ready4SkyDevice:
         self._ion = '00'  # 00 - off   01 - on
         self._conf_sound_on = False
         self._auth = False
-        self._auth_event = asyncio.Event()
+        self._response_events: dict[tuple[str, str], asyncio.Event] = {}
+        self._response_payloads: dict[tuple[str, str], list[str]] = {}
         self._conn = BLEReady4SkyClient(self.hass, self._mac, self._key, self._name)
         self._available = False
         self._state_callback: Callable[[dict], None] | None = None
         self._op_lock = asyncio.Lock()
         self._user_waiting = 0
         self._user_waiting_lock = asyncio.Lock()
+        self._power_intent = "off"
+        self._power_intent_seq = 0
         self._update_counter = 0
+        self._last_push_ts = 0.0
+        self._last_sync_ts = 0.0
+        self._last_stat_ts = 0.0
+        self._recent_command_ts: dict[str, float] = {}
+        self._offline_streak = 0
+        self._cold_mode = False
         self.initCallbacks()
 
     @property
@@ -101,7 +115,7 @@ class Ready4SkyDevice:
             "mac": self._mac,
             "available": self._available,
             "target_temperature": self._tgtemp,
-            "current_temperature": self._temp,
+            "current_temperature": self._temp if self._available else None,
             "energy_wh": self._Watts,
             "work_hours": self._alltime,
             "times_started": self._times,
@@ -122,6 +136,9 @@ class Ready4SkyDevice:
             "ionization": self._ion,
             "conf_sound_on": self._conf_sound_on,
             "auth": self._auth,
+            "cold_mode": self._cold_mode,
+            "last_push_ts": self._last_push_ts,
+            "health": self._conn.health_snapshot(),
         }
 
     def _push_state_update(self):
@@ -132,12 +149,47 @@ class Ready4SkyDevice:
         async with self._user_waiting_lock:
             return self._user_waiting > 0
 
+    def _is_in_global_command_window(self) -> bool:
+        return time.monotonic() < Ready4SkyDevice._GLOBAL_USER_COMMAND_UNTIL
+
+    def _mark_user_command_window(self) -> None:
+        Ready4SkyDevice._GLOBAL_USER_COMMAND_UNTIL = max(
+            Ready4SkyDevice._GLOBAL_USER_COMMAND_UNTIL,
+            time.monotonic() + Ready4SkyDevice._USER_COMMAND_WINDOW_SEC,
+        )
+
+    def _is_duplicate_command(self, command_key: str) -> bool:
+        now = time.monotonic()
+        prev = self._recent_command_ts.get(command_key, 0.0)
+        self._recent_command_ts[command_key] = now
+        # Coalesce only while another command is still in-flight.
+        if self._op_lock.locked() and now - prev <= Ready4SkyDevice._DUPLICATE_COMMAND_WINDOW_SEC:
+            _LOGGER.debug("Coalesced duplicate command for %s: %s", self._mac, command_key)
+            return True
+        # Under unstable BLE, UI can enqueue many identical retries; collapse them while queue exists.
+        if self._user_waiting > 0 and now - prev <= Ready4SkyDevice._QUEUED_DUPLICATE_COMMAND_WINDOW_SEC:
+            _LOGGER.debug("Coalesced duplicate command for %s: %s", self._mac, command_key)
+            return True
+        return False
+
+    async def _set_power_intent(self, intent: str) -> int:
+        async with self._user_waiting_lock:
+            self._power_intent_seq += 1
+            self._power_intent = intent
+            return self._power_intent_seq
+
+    async def _is_stale_power_intent(self, intent: str, seq: int) -> bool:
+        async with self._user_waiting_lock:
+            return self._power_intent != intent or self._power_intent_seq != seq
+
     @asynccontextmanager
     async def _user_operation(self):
         wait_started = time.monotonic()
         async with self._user_waiting_lock:
             self._user_waiting += 1
             queue_len = self._user_waiting
+            self._conn.set_user_waiters(self._user_waiting)
+        self._mark_user_command_window()
         _LOGGER.debug("User operation queued for %s (queue=%s)", self._mac, queue_len)
         try:
             async with self._op_lock:
@@ -149,6 +201,7 @@ class Ready4SkyDevice:
             async with self._user_waiting_lock:
                 self._user_waiting = max(0, self._user_waiting - 1)
                 queue_left = self._user_waiting
+                self._conn.set_user_waiters(self._user_waiting)
             _LOGGER.debug("User operation done for %s (queue=%s)", self._mac, queue_left)
 
     @property
@@ -167,11 +220,84 @@ class Ready4SkyDevice:
 
     def initCallbacks(self):
         self._conn.setConnectAfter(self.sendAuth)
-        self._conn.setCallback(Ready4SkyCommand.AUTH, self.responseAuth)
-        self._conn.setCallback(Ready4SkyCommand.VERSION, self.responseGetVersion)
-        self._conn.setCallback(Ready4SkyCommand.GET_STATUS_MODE, self.responseStatus)
-        self._conn.setCallback(Ready4SkyCommand.GET_STATISTICS_WATT, self.responseStat)
-        self._conn.setCallback(Ready4SkyCommand.GET_STARTS_COUNT, self.responseStat)
+        self._register_callback_with_ack(Ready4SkyCommand.AUTH, self.responseAuth)
+        self._register_callback_with_ack(Ready4SkyCommand.VERSION, self.responseGetVersion)
+        self._register_callback_with_ack(Ready4SkyCommand.RUN_CURRENT_MODE, self._responseAck)
+        self._register_callback_with_ack(Ready4SkyCommand.STOP_CURRENT_MODE, self._responseAck)
+        self._register_callback_with_ack(Ready4SkyCommand.SET_STATUS_MODE, self._responseAck)
+        self._register_callback_with_ack(Ready4SkyCommand.GET_STATUS_MODE, self.responseStatus)
+        self._register_callback_with_ack(Ready4SkyCommand.GET_STATISTICS_WATT, self.responseStat)
+        self._register_callback_with_ack(Ready4SkyCommand.GET_STARTS_COUNT, self.responseStat)
+
+    def _register_callback_with_ack(self, cmd: Ready4SkyCommand, handler: Callable[[list[str]], None]) -> None:
+        cmd_key = str(cmd)
+
+        def _wrapped(arr_hex: list[str]):
+            handler(arr_hex)
+            resp_iter = str(arr_hex[1]).lower() if len(arr_hex) > 1 else "00"
+            self._mark_response(cmd_key, resp_iter, arr_hex)
+
+        self._conn.setCallback(cmd, _wrapped)
+
+    def _response_wait_key(self, cmd_key: str, iter_key: str) -> tuple[str, str]:
+        return cmd_key, iter_key.lower()
+
+    def _mark_response(self, cmd_key: str, iter_key: str, arr_hex: list[str]) -> None:
+        key = self._response_wait_key(cmd_key, iter_key)
+        event = self._response_events.get(key)
+        if event is not None:
+            self._response_payloads[key] = arr_hex
+            event.set()
+
+    async def _wait_response(self, cmd_key: str, iter_key: str, timeout: float) -> list[str] | None:
+        key = self._response_wait_key(cmd_key, iter_key)
+        event = self._response_events.setdefault(key, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self._response_payloads.get(key)
+        except asyncio.TimeoutError:
+            return None
+
+    async def _send_request_and_wait(
+        self,
+        conn,
+        cmd: Ready4SkyCommand,
+        data: str = "",
+        timeout: float = 1.0,
+        *,
+        require_success: bool = False,
+    ) -> bool:
+        cmd_key = str(cmd)
+        req_iter = conn.getHexNextIter()
+        wait_key = self._response_wait_key(cmd_key, req_iter)
+        self._response_events[wait_key] = asyncio.Event()
+        response: list[str] | None = None
+        try:
+            ok = await conn.makeRequest('55' + req_iter + cmd_key + data + 'aa')
+            if not ok:
+                return False
+            response = await self._wait_response(cmd_key, req_iter, timeout)
+            ok = response is not None
+            if ok and require_success:
+                ok = self._is_success_ack(response)
+                if not ok:
+                    _LOGGER.debug(
+                        "Negative ack for %s iter=%s on %s: %s",
+                        cmd_key,
+                        req_iter,
+                        self._mac,
+                        response,
+                    )
+        finally:
+            self._response_events.pop(wait_key, None)
+            self._response_payloads.pop(wait_key, None)
+        if response is None:
+            _LOGGER.debug("Timeout waiting response for %s iter=%s on %s", cmd_key, req_iter, self._mac)
+        return ok
+
+    @staticmethod
+    def _is_success_ack(arr_hex: list[str] | None) -> bool:
+        return bool(arr_hex and len(arr_hex) > 3 and arr_hex[3] == "01")
 
     def hexToRgb(self, hexa: str):
         return tuple(int(hexa[i:i + 2], 16) for i in (0, 2, 4))
@@ -195,12 +321,8 @@ class Ready4SkyDevice:
         self._name = conn._name
 
         self._auth = False
-        self._auth_event.clear()
-        await conn.sendRequest(Ready4SkyCommand.AUTH, self._key)
-        try:
-            await asyncio.wait_for(self._auth_event.wait(), timeout=3.0)
-        except asyncio.TimeoutError as ex:
-            raise Exception('error auth timeout') from ex
+        if not await self._send_request_and_wait(conn, Ready4SkyCommand.AUTH, self._key, timeout=3.0):
+            raise Exception('error auth timeout')
 
         if self._auth is False:
             raise Exception('error auth')
@@ -215,12 +337,10 @@ class Ready4SkyDevice:
         else:
             self._auth = False
 
-        self._auth_event.set()
-
         return self._auth
 
     async def sendGetVersion(self, conn):
-        return await conn.sendRequest(Ready4SkyCommand.VERSION)
+        return await self._send_request_and_wait(conn, Ready4SkyCommand.VERSION, timeout=1.0)
 
     def responseGetVersion(self, arrHex):
         self._firmware_ver = str(self.hexToDec(arrHex[3])) + '.' + str(self.hexToDec(arrHex[4]))
@@ -231,12 +351,12 @@ class Ready4SkyDevice:
             return True
 
         if self._type in [1, 2, 3, 4, 5]:
-            return await conn.sendRequest(Ready4SkyCommand.RUN_CURRENT_MODE)
+            return await self._send_request_and_wait(conn, Ready4SkyCommand.RUN_CURRENT_MODE, timeout=1.0, require_success=True)
 
         return False
 
     async def sendOff(self, conn):
-        return await conn.sendRequest(Ready4SkyCommand.STOP_CURRENT_MODE)
+        return await self._send_request_and_wait(conn, Ready4SkyCommand.STOP_CURRENT_MODE, timeout=1.0, require_success=True)
 
     async def sendSyncDateTime(self, conn):
         if self._type in [0, 3, 4, 5]:
@@ -251,8 +371,8 @@ class Ready4SkyDevice:
         return False
 
     async def sendStat(self, conn):
-        if await conn.sendRequest(Ready4SkyCommand.GET_STATISTICS_WATT, '00'):
-            if await conn.sendRequest(Ready4SkyCommand.GET_STARTS_COUNT, '00'):
+        if await self._send_request_and_wait(conn, Ready4SkyCommand.GET_STATISTICS_WATT, '00', timeout=1.0):
+            if await self._send_request_and_wait(conn, Ready4SkyCommand.GET_STARTS_COUNT, '00', timeout=1.0):
                 return True
         return False
 
@@ -262,10 +382,11 @@ class Ready4SkyDevice:
             self._alltime = round(self._Watts / 2200, 1)  # in hours
         elif arrHex[2] == '50':  # state time
             self._times = self.hexToDec(str(arrHex[6] + arrHex[7]))
+        self._last_push_ts = time.monotonic()
         self._push_state_update()
 
     async def sendStatus(self, conn):
-        if await conn.sendRequest(Ready4SkyCommand.GET_STATUS_MODE):
+        if await self._send_request_and_wait(conn, Ready4SkyCommand.GET_STATUS_MODE, timeout=1.0):
             return True
 
         return False
@@ -321,8 +442,9 @@ class Ready4SkyDevice:
             self._status = arrHex[11]
 
         self._time_upd = time.strftime("%H:%M")
+        self._last_push_ts = time.monotonic()
         # Reflect real device mode immediately in disconnect policy.
-        self._conn.set_disconnect_delay(300 if self.is_active else 60)
+        self._conn.set_disconnect_delay(300)
         self._push_state_update()
 
     async def sendConfEnableSound(self, conn, on: bool):
@@ -331,6 +453,8 @@ class Ready4SkyDevice:
         return False
 
     async def setConfEnableSound(self, on: bool):
+        if self._is_duplicate_command(f"sound:{int(on)}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -343,6 +467,8 @@ class Ready4SkyDevice:
         return False
 
     async def setUseBacklight(self, on: bool):
+        if self._is_duplicate_command(f"backlight:{int(on)}"):
+            return True
         self._use_backlight = bool(on)
         self._push_state_update()
 
@@ -372,14 +498,30 @@ class Ready4SkyDevice:
         else:
             return True
 
-        return await conn.sendRequest(Ready4SkyCommand.SET_STATUS_MODE, str2b)
+        return await self._send_request_and_wait(
+            conn,
+            Ready4SkyCommand.SET_STATUS_MODE,
+            str2b,
+            timeout=1.0,
+            require_success=True,
+        )
 
     async def sendModeCook(self, conn, prog, sprog, temp, hours, minutes, dhours, dminutes, heat):
         if self._type == 5:
             str2b = prog + sprog + temp + hours + minutes + dhours + dminutes + heat
-            return await conn.sendRequest(Ready4SkyCommand.SET_STATUS_MODE, str2b)
+            return await self._send_request_and_wait(
+                conn,
+                Ready4SkyCommand.SET_STATUS_MODE,
+                str2b,
+                timeout=1.0,
+                require_success=True,
+            )
         else:
             return True
+
+    @staticmethod
+    def _responseAck(_arr_hex: list[str]) -> None:
+        """Ack-only callback used to complete cmd+iter waiters for control commands."""
 
     async def sendTimerCook(self, conn, hours, minutes):
         if self._type == 5:
@@ -438,6 +580,8 @@ class Ready4SkyDevice:
         return False
 
     async def startNightColor(self):
+        if self._is_duplicate_command("night_color"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -455,7 +599,13 @@ class Ready4SkyDevice:
         return False
 
     async def modeOn(self, mode=MODE_BOIL, temp: int = 0):
+        intent_seq = await self._set_power_intent("on")
+        if self._is_duplicate_command(f"mode_on:{mode}:{temp}"):
+            return True
         async with self._user_operation():
+            if await self._is_stale_power_intent("on", intent_seq):
+                _LOGGER.debug("Skipped stale modeOn for %s (newer power intent exists)", self._mac)
+                return True
             try:
                 async with self._conn as conn:
                     if self._status != STATUS_OFF:
@@ -470,7 +620,13 @@ class Ready4SkyDevice:
         return False
 
     async def modeOnCook(self, prog, sprog, temp, hours, minutes, dhours='00', dminutes='00', heat='01'):
+        intent_seq = await self._set_power_intent("on")
+        if self._is_duplicate_command(f"mode_on_cook:{prog}:{sprog}:{temp}:{hours}:{minutes}:{dhours}:{dminutes}:{heat}"):
+            return True
         async with self._user_operation():
+            if await self._is_stale_power_intent("on", intent_seq):
+                _LOGGER.debug("Skipped stale modeOnCook for %s (newer power intent exists)", self._mac)
+                return True
             try:
                 async with self._conn as conn:
                     if self._status != STATUS_OFF:
@@ -486,6 +642,8 @@ class Ready4SkyDevice:
         return False
 
     async def modeTempCook(self, temp):
+        if self._is_duplicate_command(f"mode_temp_cook:{temp}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -497,6 +655,8 @@ class Ready4SkyDevice:
         return False
 
     async def modeFan(self, speed):
+        if self._is_duplicate_command(f"mode_fan:{speed}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -512,6 +672,8 @@ class Ready4SkyDevice:
         return False
 
     async def modeIon(self, onoff):
+        if self._is_duplicate_command(f"mode_ion:{onoff}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -524,6 +686,8 @@ class Ready4SkyDevice:
         return False
 
     async def modeTimeCook(self, hours, minutes):
+        if self._is_duplicate_command(f"mode_time_cook:{hours}:{minutes}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -535,7 +699,13 @@ class Ready4SkyDevice:
         return False
 
     async def modeOff(self):
+        intent_seq = await self._set_power_intent("off")
+        if self._is_duplicate_command("mode_off"):
+            return True
         async with self._user_operation():
+            if await self._is_stale_power_intent("off", intent_seq):
+                _LOGGER.debug("Skipped stale modeOff for %s (newer power intent exists)", self._mac)
+                return True
             try:
                 async with self._conn as conn:
                     if await self.sendOff(conn):
@@ -551,6 +721,8 @@ class Ready4SkyDevice:
         temp = CONF_MAX_TEMP if temp > CONF_MAX_TEMP else temp
         self._tgtemp = temp
 
+        if self._is_duplicate_command(f"set_temp_heat:{temp}"):
+            return True
         async with self._user_operation():
             try:
                 async with self._conn as conn:
@@ -566,6 +738,24 @@ class Ready4SkyDevice:
             _LOGGER.debug("Poll skipped for %s: user operation in progress", self._mac)
             return True
 
+        visible_now = self._conn._get_ble_device() is not None
+        if not visible_now:
+            self._offline_streak += 1
+            if self._offline_streak >= 3 and not self.is_active:
+                self._cold_mode = True
+                if self._available:
+                    self._available = False
+                    self._push_state_update()
+                _LOGGER.debug("Poll cold-mode skip for %s: offline streak=%s", self._mac, self._offline_streak)
+                return True
+        else:
+            self._offline_streak = 0
+            self._cold_mode = False
+
+        if time.monotonic() - self._last_push_ts < 1.5 and not self._is_in_global_command_window():
+            _LOGGER.debug("Poll skipped for %s: recent push-notification update", self._mac)
+            return True
+
         session_acquired = False
         poll_started = time.monotonic()
         try:
@@ -574,22 +764,26 @@ class Ready4SkyDevice:
             session_acquired = True
             async with self._op_lock:
                 # Keep active devices connected; idle ones may disconnect by delay timer.
-                self._conn.set_disconnect_delay(300 if self.is_active else 60)
+                self._conn.set_disconnect_delay(300)
                 status_ok = await self.sendStatus(conn)
                 if status_ok:
                     # Give priority to user command burst; keep poll short.
-                    if await self._has_user_waiting():
+                    if await self._has_user_waiting() or self._is_in_global_command_window():
                         _LOGGER.debug("Poll shortened for %s due to pending user operation", self._mac)
                         self._available = True
                         return True
-                    if self._update_counter % 30 == 0:
+                    now_ts = time.monotonic()
+                    if now_ts - self._last_sync_ts >= 600:
                         await self.sendSyncDateTime(conn)
+                        self._last_sync_ts = now_ts
                     # Statistics are slow and not required every poll cycle.
-                    if self._update_counter % 5 == 0:
+                    stat_interval = 30.0 if self.is_active else 120.0
+                    if now_ts - self._last_stat_ts >= stat_interval:
                         await self.sendStat(conn)
+                        self._last_stat_ts = now_ts
                     self._update_counter += 1
                     self._available = True
-                    self._conn.set_disconnect_delay(300 if self.is_active else 60)
+                    self._conn.set_disconnect_delay(300)
                     _LOGGER.debug(
                         "Poll success for %s in %.3fs (active=%s, counter=%s)",
                         self._mac,
@@ -607,7 +801,7 @@ class Ready4SkyDevice:
             self._push_state_update()
             _LOGGER.debug("Poll BLE error for %s: %s", self._mac, ex)
             return False
-        except BaseException:
+        except Exception:
             self._available = False
             self._push_state_update()
             _LOGGER.exception("Poll failed for %s", self._mac)
@@ -620,17 +814,28 @@ class Ready4SkyDevice:
     async def firstConnect(self):
         _LOGGER.debug('FIRST CONNECT')
 
+        initialized = False
         async with self._op_lock:
             async with self._conn as conn:
                 if await self.sendUseBackLight(conn):
                     if await self.sendGetVersion(conn):
                         status_ok = await self.sendSyncDateTime(conn) and await self.sendStatus(conn)
                         if status_ok:
-                            await self.sendStat(conn)
                             self._update_counter += 1
                             self._available = True
+                            # Keep first connect short; statistics will be fetched by regular poll.
+                            self._last_stat_ts = 0.0
                             self._push_state_update()
-                            return True
+                            initialized = True
+
+        if initialized:
+            # Release radio immediately after startup init so next device can init
+            # without forced peer disconnect/handoff races.
+            await self._conn.disconnect()
+            # BlueZ/AcquireNotify teardown is slightly asynchronous; a short settle delay
+            # avoids immediate reconnect races on the next device startup init.
+            await asyncio.sleep(0.2)
+            return True
 
         self._available = False
         self._push_state_update()

@@ -50,7 +50,7 @@ class Ready4SkyCooker(Ready4SkyCoordinatorEntity, WaterHeaterEntity):
 
     @property
     def current_temperature(self):
-        return self.coordinator.data.get("current_temperature", 0)
+        return self.coordinator.data.get("current_temperature")
 
     @property
     def current_operation(self):

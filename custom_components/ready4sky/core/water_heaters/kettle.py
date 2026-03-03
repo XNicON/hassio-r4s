@@ -39,7 +39,7 @@ class Ready4SkyKettle(Ready4SkyCoordinatorEntity, WaterHeaterEntity):
 
     @property
     def current_temperature(self):
-        return self.coordinator.data.get("current_temperature", 0)
+        return self.coordinator.data.get("current_temperature")
 
     @property
     def target_temperature(self):

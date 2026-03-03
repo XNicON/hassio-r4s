@@ -11,12 +11,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 class Ready4SkyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    _poll_semaphore = asyncio.Semaphore(1)
     _active_devices: set[str] = set()
 
     def __init__(self, hass: HomeAssistant, device, scan_interval: int) -> None:
         self._base_interval = timedelta(seconds=scan_interval)
         self._active_interval = timedelta(seconds=min(scan_interval, 3))
+        self._cold_interval = timedelta(seconds=max(scan_interval * 2, 120))
         super().__init__(
             hass,
             logger=device.logger,
@@ -30,6 +30,7 @@ class Ready4SkyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _apply_dynamic_interval(self, data: dict[str, Any]) -> None:
         status = data.get("status")
         available = bool(data.get("available", True))
+        cold_mode = bool(data.get("cold_mode", False))
         # Active modes should be polled faster because devices don't push temp continuously.
         active_statuses = {"01", "02", "04", "05"}
         was_active_count = len(self._active_devices)
@@ -38,7 +39,12 @@ class Ready4SkyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             self._active_devices.discard(self.device._mac)
 
-        self.update_interval = self._active_interval if self._active_devices else self._base_interval
+        if self._active_devices:
+            self.update_interval = self._active_interval
+        elif cold_mode or not available:
+            self.update_interval = self._cold_interval
+        else:
+            self.update_interval = self._base_interval
         if len(self._active_devices) != was_active_count:
             _LOGGER.debug(
                 "Active device set changed: %s (interval=%ss)",
@@ -59,10 +65,9 @@ class Ready4SkyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         async with self._lock:
-            async with self._poll_semaphore:
-                _LOGGER.debug("Coordinator poll start for %s", self.device._mac)
-                await self.device.update(None)
-                data = self.device.export_state()
-                self._apply_dynamic_interval(data)
-                _LOGGER.debug("Coordinator poll done for %s", self.device._mac)
-                return data
+            _LOGGER.debug("Coordinator poll start for %s", self.device._mac)
+            await self.device.update(None)
+            data = self.device.export_state()
+            self._apply_dynamic_interval(data)
+            _LOGGER.debug("Coordinator poll done for %s", self.device._mac)
+            return data

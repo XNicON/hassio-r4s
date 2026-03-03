@@ -6,6 +6,7 @@ import binascii
 import inspect
 import logging
 import time
+import weakref
 from textwrap import wrap
 
 from bleak import (BleakClient, BleakError)
@@ -19,18 +20,25 @@ _LOGGER = logging.getLogger(__name__)
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-_GLOBAL_CONNECT_SEM: asyncio.Semaphore | None = None
+_GLOBAL_RADIO_SEM: asyncio.Semaphore | None = None
+_GLOBAL_CLIENTS: "weakref.WeakSet[BLEReady4SkyClient]" = weakref.WeakSet()
+_GLOBAL_LAST_DISCONNECT_TS = 0.0
+_GLOBAL_CONNECT_SETTLE_SEC = 0.8
 
 
 class BusyConnectionError(BleakError):
     """Transient non-failure state: another connect flow is in progress."""
 
 
-def _get_global_connect_sem() -> asyncio.Semaphore:
-    global _GLOBAL_CONNECT_SEM
-    if _GLOBAL_CONNECT_SEM is None:
-        _GLOBAL_CONNECT_SEM = asyncio.Semaphore(1)
-    return _GLOBAL_CONNECT_SEM
+def _get_global_radio_sem() -> asyncio.Semaphore:
+    global _GLOBAL_RADIO_SEM
+    if _GLOBAL_RADIO_SEM is None:
+        _GLOBAL_RADIO_SEM = asyncio.Semaphore(1)
+    return _GLOBAL_RADIO_SEM
+
+
+def _seconds_since_last_disconnect() -> float:
+    return time.monotonic() - _GLOBAL_LAST_DISCONNECT_TS
 
 
 class BLEReady4SkyClient:
@@ -51,13 +59,90 @@ class BLEReady4SkyClient:
         self._session_lock = asyncio.Lock()
         self._notifications_enabled = False
         self._session_users = 0
+        self._holds_global_radio = False
+        self._radio_waiters = 0
+        self._user_waiters = 0
+        self._disconnect_done = asyncio.Event()
+        self._disconnect_done.set()
         self._disconnect_task: asyncio.Task | None = None
-        self._disconnect_delay = 60
+        self._disconnect_delay = 300
         self._backoff_seconds = 0
         self._max_backoff_seconds = 20
         self._next_connect_ts = 0.0
         self._connection_epoch = 0
         self._last_activity = time.monotonic()
+        self._connect_fail_streak = 0
+        self._connect_fail_total = 0
+        self._connect_success_total = 0
+        self._last_connect_ok_ts = 0.0
+        self._last_connect_fail_ts = 0.0
+        self._avg_connect_ms = 0.0
+        _GLOBAL_CLIENTS.add(self)
+
+    async def _session_users_count(self) -> int:
+        async with self._session_lock:
+            return self._session_users
+
+    async def _wait_and_disconnect_peers(self, blocking: bool) -> None:
+        """Ensure no other Ready4Sky client keeps active BLE link while we connect."""
+        deadline = time.monotonic() + 3.0 if blocking else time.monotonic()
+        while True:
+            busy_peers: list[str] = []
+            disconnected_any = False
+            for peer in list(_GLOBAL_CLIENTS):
+                if peer is self:
+                    continue
+                conn = peer._conn
+                if conn is None or not conn.is_connected:
+                    continue
+                # Poll/background connect must not steal radio from connected peer.
+                # Handoff is allowed only for blocking (user) operations.
+                if not blocking:
+                    raise BusyConnectionError(f"Peer holds BLE link: {peer._mac}")
+                peer_users = await peer._session_users_count()
+                if (
+                    peer_users > 0
+                    or peer._user_waiters > 0
+                    or peer._write_lock.locked()
+                    or peer._connect_lock.locked()
+                ):
+                    busy_peers.append(peer._mac)
+                    continue
+                _LOGGER.debug(
+                    "Disconnecting peer %s before connecting %s (single-radio mode)",
+                    peer._mac,
+                    self._mac,
+                )
+                await peer.disconnect()
+                disconnected_any = True
+            if not busy_peers:
+                return
+            if not blocking:
+                raise BusyConnectionError(f"Peer is busy: {', '.join(busy_peers)}")
+            if time.monotonic() >= deadline:
+                raise BleakError(f"Timed out waiting for peer session to finish: {', '.join(busy_peers)}")
+            if not disconnected_any:
+                await asyncio.sleep(0.1)
+
+    def _has_peer_radio_waiters(self) -> bool:
+        for peer in list(_GLOBAL_CLIENTS):
+            if peer is self:
+                continue
+            # Immediate handoff should favor queued user commands, not poll waiters.
+            if peer._radio_waiters > 0 and peer._user_waiters > 0:
+                return True
+        return False
+
+    def set_user_waiters(self, count: int) -> None:
+        self._user_waiters = max(0, int(count))
+
+    def _has_peer_user_waiters(self) -> bool:
+        for peer in list(_GLOBAL_CLIENTS):
+            if peer is self:
+                continue
+            if peer._user_waiters > 0:
+                return True
+        return False
 
     def _get_ble_device(self):
         device = bluetooth.async_ble_device_from_address(self._hass, self._mac, True)
@@ -122,6 +207,22 @@ class BLEReady4SkyClient:
         self._backoff_seconds = 0
         self._next_connect_ts = 0.0
 
+    def _record_connect_success(self, duration_s: float):
+        self._connect_success_total += 1
+        self._connect_fail_streak = 0
+        self._last_connect_ok_ts = time.time()
+        connect_ms = duration_s * 1000.0
+        # EMA keeps the metric stable but still responsive to regression.
+        if self._avg_connect_ms <= 0:
+            self._avg_connect_ms = connect_ms
+        else:
+            self._avg_connect_ms = (self._avg_connect_ms * 0.8) + (connect_ms * 0.2)
+
+    def _record_connect_failure(self):
+        self._connect_fail_total += 1
+        self._connect_fail_streak += 1
+        self._last_connect_fail_ts = time.time()
+
     async def __aenter__(self):
         return await self.acquire_session(blocking=True)
 
@@ -133,19 +234,67 @@ class BLEReady4SkyClient:
         started = time.monotonic()
         attempts = 1 if not blocking else 1000000
         for _ in range(attempts):
-            await self.ensure_connected(blocking=blocking)
-            async with self._session_lock:
-                if self._conn is not None and self._conn.is_connected:
-                    self._last_activity = time.monotonic()
-                    self._session_users += 1
-                    _LOGGER.debug(
-                        "BLE session acquired for %s in %.3fs (blocking=%s, users=%s)",
-                        self._mac,
-                        time.monotonic() - started,
-                        blocking,
-                        self._session_users,
-                    )
-                    return self
+            acquired_radio = False
+            adopted_radio = False
+            already_holds_radio = False
+            waiting_for_radio = False
+            try:
+                async with self._session_lock:
+                    already_holds_radio = self._holds_global_radio
+                    if self._session_users > 0 and self._conn is not None and self._conn.is_connected:
+                        self._last_activity = time.monotonic()
+                        self._session_users += 1
+                        _LOGGER.debug(
+                            "BLE session acquired for %s in %.3fs (blocking=%s, users=%s)",
+                            self._mac,
+                            time.monotonic() - started,
+                            blocking,
+                            self._session_users,
+                        )
+                        return self
+
+                if not already_holds_radio:
+                    radio_sem = _get_global_radio_sem()
+                    if not blocking and self._has_peer_user_waiters():
+                        raise BusyConnectionError("Peer has pending user operations")
+                    self._radio_waiters += 1
+                    waiting_for_radio = True
+                    if blocking:
+                        await radio_sem.acquire()
+                        acquired_radio = True
+                    else:
+                        try:
+                            await asyncio.wait_for(radio_sem.acquire(), timeout=0.001)
+                            acquired_radio = True
+                        except asyncio.TimeoutError as ex:
+                            raise BusyConnectionError("Global radio slot is busy") from ex
+
+                await self.ensure_connected(blocking=blocking)
+                async with self._session_lock:
+                    if self._conn is not None and self._conn.is_connected:
+                        self._last_activity = time.monotonic()
+                        self._session_users += 1
+                        if acquired_radio:
+                            # This session now owns global radio until users drop to 0.
+                            self._holds_global_radio = True
+                            adopted_radio = True
+                        _LOGGER.debug(
+                            "BLE session acquired for %s in %.3fs (blocking=%s, users=%s)",
+                            self._mac,
+                            time.monotonic() - started,
+                            blocking,
+                            self._session_users,
+                        )
+                        return self
+            except BusyConnectionError:
+                raise
+            except Exception:
+                raise
+            finally:
+                if waiting_for_radio:
+                    self._radio_waiters = max(0, self._radio_waiters - 1)
+                if acquired_radio and not adopted_radio:
+                    _get_global_radio_sem().release()
             if not blocking:
                 break
             # Avoid tight spin loop when connection is unstable.
@@ -172,6 +321,22 @@ class BLEReady4SkyClient:
                 raise BusyConnectionError(f"Device is not visible in HA BLE cache: {self._mac}")
 
         async with self._connect_lock:
+            settle_left = _GLOBAL_CONNECT_SETTLE_SEC - _seconds_since_last_disconnect()
+            if settle_left > 0:
+                if not blocking:
+                    raise BusyConnectionError(
+                        f"Radio settle in progress ({settle_left:.2f}s after disconnect)"
+                    )
+                await asyncio.sleep(settle_left)
+
+            if not self._disconnect_done.is_set():
+                if not blocking:
+                    raise BusyConnectionError("Disconnect in progress")
+                try:
+                    await asyncio.wait_for(self._disconnect_done.wait(), timeout=5.0)
+                except asyncio.TimeoutError as ex:
+                    raise BleakError(f"Timed out waiting disconnect completion for {self._mac}") from ex
+
             is_connected = self._conn is not None and self._conn.is_connected
             if is_connected:
                 if not self._notifications_enabled:
@@ -187,30 +352,9 @@ class BLEReady4SkyClient:
                 )
                 raise BusyConnectionError(f"Reconnect backoff is active for {wait_seconds}s")
 
-            slot = _get_global_connect_sem()
-
-            acquired = False
-
-            slot_wait_started = time.monotonic()
-            if blocking:
-                await slot.acquire()
-                acquired = True
-            else:
-                # Non-blocking poll path must not wait here and delay user operations.
-                try:
-                    await asyncio.wait_for(slot.acquire(), timeout=0.001)
-                    acquired = True
-                except asyncio.TimeoutError as ex:
-                    _LOGGER.debug("Skipping non-blocking connect for %s: global connect slot is busy", self._mac)
-                    raise BusyConnectionError("Another device is connecting; skipping non-blocking connect") from ex
-
-            slot_wait = time.monotonic() - slot_wait_started
-
-            if slot_wait > 0.01:
-                _LOGGER.debug("Waited %.3fs for global connect slot: %s", slot_wait, self._mac)
-
             try:
                 # BlueZ is sensitive to concurrent connect attempts across devices.
+                await self._wait_and_disconnect_peers(blocking=blocking)
                 connect_started = time.monotonic()
                 self._device = await self._resolve_ble_device(attempts=12, delay=1.0) or self._device
                 if self._device is not None:
@@ -235,7 +379,9 @@ class BLEReady4SkyClient:
                         disconnected_callback=lambda client: self._handle_disconnect(client, epoch),
                     )
                     await self._conn.connect()
-                _LOGGER.debug("BLE connected to %s in %.3fs", self._mac, time.monotonic() - connect_started)
+                connect_duration = time.monotonic() - connect_started
+                _LOGGER.debug("BLE connected to %s in %.3fs", self._mac, connect_duration)
+                self._record_connect_success(connect_duration)
 
                 self._available = True
                 self._reset_backoff()
@@ -247,6 +393,7 @@ class BLEReady4SkyClient:
             except BleakOutOfConnectionSlotsError as ex:
                 _LOGGER.warning("No BLE connection slots available for %s: %s", self._mac, ex)
                 self._available = False
+                self._record_connect_failure()
                 self._schedule_backoff()
                 raise
             except BusyConnectionError:
@@ -254,18 +401,17 @@ class BLEReady4SkyClient:
             except BleakError as ex:
                 self._available = False
                 _LOGGER.debug("Device %s is not available for connection yet: %s", self._mac, ex)
+                self._record_connect_failure()
                 self._schedule_backoff()
                 await self.disconnect()
                 raise
             except Exception as ex:
                 _LOGGER.error('Unable to connect')
                 _LOGGER.exception(ex)
+                self._record_connect_failure()
                 self._schedule_backoff()
                 await self.disconnect()
                 raise ex
-            finally:
-                if acquired:
-                    slot.release()
 
         return self
 
@@ -283,24 +429,60 @@ class BLEReady4SkyClient:
 
         try:
             await self._conn.get_services()
-        except BaseException:
+        except Exception:
             pass
 
         # On BlueZ + AcquireNotify direct CCCD writes are rejected. Let Bleak/BlueZ
         # handle enabling notifications internally via start_notify.
-        await self._conn.start_notify(UART_TX_CHAR_UUID, self.handleNotification)
-        self._notifications_enabled = True
+        try:
+            await self._conn.start_notify(UART_TX_CHAR_UUID, self.handleNotification)
+            self._notifications_enabled = True
+        except BleakError as ex:
+            message = str(ex)
+            # BlueZ may report NotPermitted/Notify acquired when notifications are
+            # already active on this characteristic. Treat as success and continue.
+            if "Notify acquired" in message or "NotPermitted" in message:
+                self._notifications_enabled = True
+                _LOGGER.debug(
+                    "Notifications already active for %s (%s), using existing AcquireNotify session",
+                    self._mac,
+                    message,
+                )
+                return
+            raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.release_session()
 
     async def release_session(self):
         should_schedule_disconnect = False
+        release_global_radio = False
+        handoff_disconnect_now = False
         async with self._session_lock:
             if self._session_users > 0:
                 self._session_users -= 1
             should_schedule_disconnect = self._session_users == 0
+            if should_schedule_disconnect and self._holds_global_radio:
+                # Fast handoff: if another device is waiting for radio, release this
+                # link immediately instead of waiting disconnect_delay.
+                if self._has_peer_radio_waiters():
+                    handoff_disconnect_now = True
+                else:
+                    self._holds_global_radio = False
+                    release_global_radio = True
             users = self._session_users
+
+        if handoff_disconnect_now:
+            _LOGGER.debug("Immediate radio handoff from %s: peer waiter detected", self._mac)
+            await self.disconnect()
+            async with self._session_lock:
+                if self._holds_global_radio:
+                    self._holds_global_radio = False
+            _get_global_radio_sem().release()
+            return
+
+        if release_global_radio:
+            _get_global_radio_sem().release()
 
         if should_schedule_disconnect and (self._disconnect_task is None or self._disconnect_task.done()):
             _LOGGER.debug("Scheduling delayed disconnect for %s in %ss", self._mac, self._disconnect_delay)
@@ -330,7 +512,17 @@ class BLEReady4SkyClient:
         return {str(device.address): str(device.name) for device in devices}
 
     async def disconnect(self):
+        global _GLOBAL_LAST_DISCONNECT_TS
         try:
+            current_task = asyncio.current_task()
+            if (
+                self._disconnect_task is not None
+                and not self._disconnect_task.done()
+                and self._disconnect_task is not current_task
+            ):
+                self._disconnect_task.cancel()
+            self._disconnect_task = None
+            self._disconnect_done.clear()
             conn = self._conn
             self._connection_epoch += 1
             self._conn = None
@@ -340,15 +532,18 @@ class BLEReady4SkyClient:
                 # With AcquireNotify BlueZ closes the notify FD on disconnect; explicit
                 # stop_notify is unnecessary and often raises. Simply disconnect.
                 await conn.disconnect()
+                _GLOBAL_LAST_DISCONNECT_TS = time.monotonic()
 
             self._iter = 0
         except asyncio.CancelledError:
             # Can happen during connect/disconnect race in BlueZ; treat as benign.
             _LOGGER.debug("disconnect cancelled for %s", self._mac)
-        except BaseException as ex:
+        except Exception as ex:
             self._available = False
             _LOGGER.error('disconnect failed')
             _LOGGER.exception(ex)
+        finally:
+            self._disconnect_done.set()
 
     def handleNotification(self, handle, data):
         arrData = wrap(binascii.b2a_hex(data).decode("utf-8"), 2)
@@ -386,7 +581,13 @@ class BLEReady4SkyClient:
         return False
 
     async def sendRequest(self, cmdHex, dataHex=''):
-        return await self.makeRequest('55' + self.getHexNextIter() + str(cmdHex) + dataHex + 'aa')
+        ok, _iter_hex = await self.sendRequestWithIter(cmdHex, dataHex)
+        return ok
+
+    async def sendRequestWithIter(self, cmdHex, dataHex=''):
+        iter_hex = self.getHexNextIter()
+        ok = await self.makeRequest('55' + iter_hex + str(cmdHex) + dataHex + 'aa')
+        return ok, iter_hex
 
     @staticmethod
     def hexToDec(hexStr: str) -> int:
@@ -411,3 +612,14 @@ class BLEReady4SkyClient:
 
     def set_disconnect_delay(self, seconds: int) -> None:
         self._disconnect_delay = max(0, int(seconds))
+
+    def health_snapshot(self) -> dict:
+        return {
+            "connect_fail_streak": self._connect_fail_streak,
+            "connect_fail_total": self._connect_fail_total,
+            "connect_success_total": self._connect_success_total,
+            "last_connect_ok_ts": self._last_connect_ok_ts,
+            "last_connect_fail_ts": self._last_connect_fail_ts,
+            "avg_connect_ms": round(self._avg_connect_ms, 1),
+            "backoff_seconds": self._backoff_seconds,
+        }

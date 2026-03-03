@@ -7,10 +7,7 @@
                 "description": "Is need help - click (?)",
                 "data": {
                     "device": "Bluetooth device",
-                    "mac": "Device's name and MAC-address",
-                    "password": "Password (8 byte length and HEX)",
-                    "scan_interval": "Scan interval (from 10 to 300 seconds)",
-                    "use_backlight": "Use the backlight in standby mode (for supported devices)"
+                    "mac": "Device's name and MAC-address"
                 }
             },
             "info": {
@@ -19,9 +16,7 @@
             }
         },
         "error": {
-            "wrong_password": "Password is not valid (8 byte length and HEX)",
             "wrong_mac": "MAC is malformed",
-            "wrong_scan_interval": "Scan interval should be from 10 to 300 seconds",
             "device_not_supported": "Selected device is not supported, contact developer"
         },
         "abort": {

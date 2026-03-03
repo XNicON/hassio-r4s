@@ -49,7 +49,6 @@ SUPPORTED_DEVICES = {
     'RFS-KKL003': 1,  # aka RK-G214S
     'RFS-KKL004': 1,  # aka RK-G213S, RK-G214S
     'RFS-KMC002': 5,  # aka RMC-M225S
-
 }
 
 COOKER_PROGRAMS = {

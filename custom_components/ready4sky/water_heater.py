@@ -8,10 +8,10 @@ from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import (
-    DOMAIN
+    Ready4SkyRuntimeData
 )
-from .water_heaters.cooker import RedmondCooker
-from .water_heaters.kettle import RedmondKettle
+from .core.water_heaters.cooker import Ready4SkyCooker
+from .core.water_heaters.kettle import Ready4SkyKettle
 
 
 async def async_setup_entry(
@@ -19,13 +19,15 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback
 ) -> None:
-    kettle = hass.data[DOMAIN][config_entry.entry_id]
+    runtime_data: Ready4SkyRuntimeData = config_entry.runtime_data
+    coordinator = runtime_data.coordinator
+    kettle = coordinator.device
 
     if kettle._type in [0, 1, 2]:
-        async_add_entities([RedmondKettle(kettle)])
+        async_add_entities([Ready4SkyKettle(coordinator)])
 
     elif kettle._type == 5:
-        async_add_entities([RedmondCooker(kettle)])
+        async_add_entities([Ready4SkyCooker(coordinator)])
 
         platform = entity_platform.current_platform.get()
         platform.async_register_entity_service(

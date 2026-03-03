@@ -1,18 +1,14 @@
 #!/usr/local/bin/python3
 # coding: utf-8
 
-from homeassistant.components.fan import (
-    FanEntity,
-    FanEntityDescription,
-    FanEntityFeature
-)
+from homeassistant.components.fan import FanEntity, FanEntityDescription, FanEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import DOMAIN, SIGNAL_UPDATE_DATA, STATUS_ON, MODE_BOIL
+from . import Ready4SkyRuntimeData
+from .core.const import MODE_BOIL, STATUS_OFF, STATUS_ON
+from .core.entity import Ready4SkyCoordinatorEntity
 
 
 async def async_setup_entry(
@@ -20,91 +16,49 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback
 ) -> None:
-    kettle = hass.data[DOMAIN][config_entry.entry_id]
-    if kettle._type == 3:
-        async_add_entities([RedmondFan(kettle)])
+    runtime_data: Ready4SkyRuntimeData = config_entry.runtime_data
+    coordinator = runtime_data.coordinator
+    if coordinator.device._type == 3:
+        async_add_entities([Ready4SkyFan(coordinator)])
 
 
-class RedmondFan(FanEntity):
-    def __init__(self, kettle):
-        self._kettle = kettle
+class Ready4SkyFan(Ready4SkyCoordinatorEntity, FanEntity):
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
         self.entity_description = FanEntityDescription(
             key="fan_on",
-            name=kettle._name + " Fan",
+            name=f"{self._device._name} Fan",
             icon="mdi:fan",
         )
-
-        self._attr_unique_id = f'{DOMAIN}[{kettle._mac}][fan][{self.entity_description.key}]'
-        self._attr_device_info = DeviceInfo(connections={("mac", kettle._mac)})
-
-        self._attr_is_on = False
-        # self._perc = 0
-        self._speed = '01'
-
-    async def async_added_to_hass(self):
-        self.update()
-        self.async_on_remove(async_dispatcher_connect(self._kettle.hass, SIGNAL_UPDATE_DATA, self.update))
-
-    def update(self):
-        self._attr_is_on = False
-        if self._kettle._mode == MODE_BOIL:
-            self._speed = '01'
-        else:
-            self._speed = self._kettle._mode
-        #        if self._kettler._mode == '00' or not self._kettler._status == STATUS_ON:
-        #            self._perc = 0
-        #        else:
-        #            self._perc = ordered_list_item_to_percentage(ORDERED_NAMED_FAN_SPEEDS, self._kettler._mode)
-        if self._kettle._status == STATUS_ON:
-            self._attr_is_on = True
-        self.schedule_update_ha_state()
-
-    #    async def async_set_percentage(self, percentage: int) -> None:
-    #        if percentage == 0:
-    #            await self.async_turn_off()
-    #        else:
-    #            speed = percentage_to_ordered_list_item(ORDERED_NAMED_FAN_SPEEDS, percentage)
-    #            await self._kettler.modeFan(speed)
-
-    async def async_set_speed(self, speed: str) -> None:
-        if speed == '00':
-            await self._kettle.modeOff()
-        else:
-            await self._kettle.modeFan(speed)
-
-    async def async_turn_on(self, speed: str = None, percentage: int = None, preset_mode: str = None, **kwargs, ) -> None:
-        if speed is not None:
-            await self.async_set_speed(speed)
-        else:
-            await self.async_set_speed('01')
-
-    #        if percentage is not None:
-    #            await self.async_set_percentage(percentage)
-    #        else:
-    #            await self.async_set_percentage(0)
-
-    async def async_turn_off(self, **kwargs) -> None:
-        await self._kettle.modeOff()
+        self._attr_unique_id = self._build_unique_id("fan", self.entity_description.key)
 
     @property
-    def should_poll(self):
-        return False
-
-    @property
-    def available(self):
-        return self._kettle._available
+    def is_on(self):
+        return self.coordinator.data.get("status") == STATUS_ON
 
     @property
     def speed(self):
-        return self._speed
+        mode = self.coordinator.data.get("mode", MODE_BOIL)
+        return '01' if mode == MODE_BOIL else mode
 
     @property
     def speed_list(self):
         return ['01', '02', '03', '04', '05', '06']
 
-    #    @property
-    #    def percentage(self) -> int:
-    #        return self._perc
+    async def async_set_speed(self, speed: str) -> None:
+        if speed == '00':
+            self._optimistic_update(status=STATUS_OFF)
+            await self._device.modeOff()
+        else:
+            self._optimistic_update(status=STATUS_ON, mode=speed)
+            await self._device.modeFan(speed)
+
+    async def async_turn_on(self, speed: str = None, percentage: int = None, preset_mode: str = None, **kwargs) -> None:
+        await self.async_set_speed(speed or '01')
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self._optimistic_update(status=STATUS_OFF)
+        await self._device.modeOff()
 
     @property
     def supported_features(self) -> int:

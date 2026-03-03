@@ -4,7 +4,7 @@
 
 Allows you to connect Redmond Kettle, Cooker, Socket and Heat to your Home Assistant.
 
-###### _Full list of supported devices see in: [r4sconst.py](https://github.com/XNicON/hassio-r4s/blob/master/custom_components/ready4sky/r4sconst.py)_
+###### _Full list of supported devices see in: [r4sconst.py](https://github.com/XNicON/hassio-r4s/blob/master/custom_components/ready4sky/core/r4sconst.py)_
 
 ---
 

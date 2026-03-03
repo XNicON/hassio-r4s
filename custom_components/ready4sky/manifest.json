@@ -1,17 +1,19 @@
 {
     "domain": "ready4sky",
     "name": "ready4sky",
-    "version": "1.5",
+    "version": "2.0",
     "documentation": "https://github.com/XNicON/hassio-r4s/blob/master/README.md",
     "dependencies": [
-        "bluetooth"
+        "bluetooth",
+        "bluetooth_adapters"
     ],
     "codeowners": [
         "@mavrikk",
         "@XNicON"
     ],
     "requirements": [
-        "bleak>=0.15.0"
+        "bleak>=0.15.0",
+        "bleak-retry-connector>=3.7.3"
     ],
     "config_flow": true
 }
